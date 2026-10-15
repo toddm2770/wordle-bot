@@ -1,0 +1,25 @@
+# Ready-to-use stack that pulls the published image (no source code needed).
+# 1. Replace <github-user> below with your GitHub username (lowercase).
+# 2. Put your secrets in a .env file next to this file (see .env.example).
+# 3. docker compose up -d        (update later: docker compose pull && docker compose up -d)
+
+services:
+  wordle-bot:
+    image: ghcr.io/<github-user>/wordlebot:latest
+    container_name: wordle-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /mnt/media/appdata/wordle-bot/data:/data:ro
+    networks:
+      - fluxer
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  fluxer:
+    external: true
+    name: ${FLUXER_DOCKER_NETWORK:?set FLUXER_DOCKER_NETWORK in .env}

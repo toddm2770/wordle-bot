@@ -1,0 +1,67 @@
+# Wordle bot for a self-hosted Fluxer instance.
+# Runs as its own container; it only makes OUTBOUND connections (Fluxer API,
+# Fluxer gateway, PostgreSQL, nytimes.com), so it needs no published ports and
+# no Nginx Proxy Manager entry.
+#
+#   docker compose up -d --build        # build and start
+#   docker compose logs -f wordle-bot   # follow logs
+#   docker compose run --rm wordle-bot --check   # connectivity test only
+
+name: wordle-bot
+
+services:
+  wordle-bot:
+    build: .
+    image: wordle-bot:latest
+    container_name: wordle-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: ${TZ:-America/New_York}            # timestamps in logs
+    volumes:
+      # Persistent bot files (optional custom word list, backups). Game data
+      # itself lives in PostgreSQL.
+      - /mnt/media/appdata/wordle-bot/data:/data:ro
+    networks:
+      - fluxer
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Optional: uncomment if you enable the standalone database below.
+    # depends_on:
+    #   wordle-db:
+    #     condition: service_healthy
+
+  # Only needed if you do NOT want to use Fluxer's PostgreSQL.
+  # Start with: docker compose --profile standalone-db up -d
+  wordle-db:
+    profiles: ["standalone-db"]
+    image: postgres:16-alpine
+    container_name: wordle-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wordle_bot
+      POSTGRES_PASSWORD: ${WORDLE_DB_PASSWORD:?set WORDLE_DB_PASSWORD in .env}
+      POSTGRES_DB: wordle_bot
+    volumes:
+      - /mnt/media/appdata/wordle-bot/postgres:/var/lib/postgresql/data
+    networks:
+      - fluxer
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wordle_bot -d wordle_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  fluxer:
+    # Fluxer's existing Docker network (find it with `docker network ls`).
+    external: true
+    name: ${FLUXER_DOCKER_NETWORK:?set FLUXER_DOCKER_NETWORK in .env}
