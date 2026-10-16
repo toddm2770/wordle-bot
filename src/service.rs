@@ -50,6 +50,8 @@ pub struct GameView {
     pub puzzle_number: i32,
     pub mode: GameMode,
     pub status: GameStatus,
+    /// Community the game was started from (its streak is credited on a win).
+    pub guild_id: Option<i64>,
     pub guesses: Vec<Guess>,
     /// Only populated once the player has lost; never exposed earlier.
     pub solution: Option<String>,
@@ -135,6 +137,23 @@ pub enum ShareOutcome {
     Ready(ShareData),
 }
 
+/// A community's shared streak: consecutive days on which at least one player
+/// solved the puzzle from that community.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct CommunityStreak {
+    pub current: i32,
+    pub longest: i32,
+    pub puzzle_number: Option<i32>,
+    /// Display names of today's solvers, in the order they solved.
+    pub solved_today: Vec<String>,
+}
+
+impl CommunityStreak {
+    pub fn safe_today(&self) -> bool {
+        !self.solved_today.is_empty()
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum LeaderboardSort {
     #[default]
@@ -207,6 +226,7 @@ struct GameRow {
     mode: String,
     guesses_used: i16,
     status: String,
+    guild_id: Option<i64>,
     solution: String,
 }
 
@@ -282,6 +302,7 @@ impl GameService {
             puzzle_number: row.puzzle_number,
             mode: GameMode::parse(&row.mode).unwrap_or_default(),
             status,
+            guild_id: row.guild_id,
             guesses,
             solution: (status == GameStatus::Lost).then(|| row.solution.clone()),
         }
@@ -289,7 +310,7 @@ impl GameService {
 
     async fn lock_todays_game(tx: &mut Tx<'_>, user_id: i64, today: NaiveDate) -> Result<Option<GameRow>> {
         Ok(sqlx::query_as::<_, GameRow>(
-            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, p.solution
+            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, g.guild_id, p.solution
              FROM wordle_games g JOIN wordle_daily_puzzles p USING (puzzle_date)
              WHERE g.user_id = $1 AND g.puzzle_date = $2
              FOR UPDATE OF g",
@@ -562,7 +583,7 @@ impl GameService {
         let today = self.today();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query_as::<_, GameRow>(
-            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, p.solution
+            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, g.guild_id, p.solution
              FROM wordle_games g JOIN wordle_daily_puzzles p USING (puzzle_date)
              WHERE g.user_id = $1 AND g.puzzle_date = $2",
         )
@@ -624,6 +645,42 @@ impl GameService {
                 guesses_used: v.guesses.len(),
                 rows: v.guesses.iter().map(|g| g.feedback).collect(),
             }),
+        })
+    }
+
+    /// Community streak for `guild_id`, recomputed from game history: a day counts
+    /// when any game started from this community that day was won. Losses do not
+    /// break it; only a day with no solves does.
+    pub async fn community_streak(&self, guild_id: i64) -> Result<CommunityStreak> {
+        let today = self.today();
+        let days: Vec<(NaiveDate,)> = sqlx::query_as(
+            "SELECT DISTINCT puzzle_date FROM wordle_games
+             WHERE guild_id = $1 AND status = 'won' AND puzzle_date <= $2
+             ORDER BY puzzle_date",
+        )
+        .bind(guild_id)
+        .bind(today)
+        .fetch_all(&self.pool)
+        .await?;
+        let finished: Vec<FinishedGame> = days.into_iter().map(|(date,)| FinishedGame { date, won: true }).collect();
+        let s = streaks::compute(&finished, today);
+
+        let solvers: Vec<(String,)> = sqlx::query_as(
+            "SELECT p.display_name FROM wordle_games g JOIN wordle_players p USING (user_id)
+             WHERE g.guild_id = $1 AND g.puzzle_date = $2 AND g.status = 'won'
+             ORDER BY g.completed_at, g.id",
+        )
+        .bind(guild_id)
+        .bind(today)
+        .fetch_all(&self.pool)
+        .await?;
+        let puzzle_number = self.puzzles.cached(today).await?.map(|p| p.puzzle_number);
+
+        Ok(CommunityStreak {
+            current: s.current,
+            longest: s.longest,
+            puzzle_number,
+            solved_today: solvers.into_iter().map(|(n,)| n).collect(),
         })
     }
 

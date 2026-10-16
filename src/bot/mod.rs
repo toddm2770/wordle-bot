@@ -78,13 +78,24 @@ impl Bot {
                 }
                 Some(g) => match self.service.leaderboard(g, sort).await {
                     Ok(entries) => {
-                        self.reply(channel, &render::leaderboard(&entries, sort, self.leaderboard_size, &self.prefix)).await
+                        let community = self.community(g).await;
+                        let out = render::leaderboard(&entries, sort, self.leaderboard_size, &self.prefix, community.as_ref());
+                        self.reply(channel, &out).await
                     }
                     Err(e) => self.internal_error(channel, &e).await,
                 },
             },
             Command::Mode(mode) => self.set_mode(channel, &player, mode).await,
-            Command::Share => self.share(channel, &player, guild_id.is_some()).await,
+            Command::Share => self.share(channel, &player, guild_id).await,
+            Command::Community => match guild_id {
+                None => {
+                    self.reply(channel, &OutgoingMessage::text("The community streak belongs to a server. Run this command in a server channel.")).await
+                }
+                Some(g) => match self.service.community_streak(g).await {
+                    Ok(c) => self.reply(channel, &render::community_streak(&c, &self.prefix)).await,
+                    Err(e) => self.internal_error(channel, &e).await,
+                },
+            },
         }
     }
 
@@ -163,7 +174,13 @@ impl Bot {
             Ok(GuessOutcome::Rejected(r)) => self.reply(channel, &render::guess_rejected(&r, &self.prefix)).await,
             Ok(GuessOutcome::Accepted { view, stats }) => {
                 let out = match (view.status, stats) {
-                    (GameStatus::Won, Some(s)) => render::won(&view, &s, &self.prefix),
+                    (GameStatus::Won, Some(s)) => {
+                        let community = match view.guild_id {
+                            Some(g) => self.community(g).await,
+                            None => None,
+                        };
+                        render::won(&view, &s, &self.prefix, community.as_ref())
+                    }
                     (GameStatus::Lost, Some(s)) => render::lost(&view, &s),
                     _ => render::board(&view, None, &self.prefix),
                 };
@@ -235,16 +252,30 @@ impl Bot {
         }
     }
 
-    async fn share(&self, channel: &str, player: &Player, in_guild: bool) {
-        if !in_guild {
+    /// Community streak for decorating other messages; failures are logged, not shown.
+    async fn community(&self, guild_id: i64) -> Option<crate::service::CommunityStreak> {
+        match self.service.community_streak(guild_id).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(guild_id, error = %e, "could not load community streak");
+                None
+            }
+        }
+    }
+
+    async fn share(&self, channel: &str, player: &Player, guild_id: Option<i64>) {
+        let Some(guild) = guild_id else {
             return self
                 .reply(channel, &OutgoingMessage::text(format!("Run `{} share` in a server channel to post your result there.", self.prefix)))
                 .await;
-        }
+        };
         let text = match self.service.share(player.user_id).await {
             Ok(ShareOutcome::NoGame) => format!("You haven't played today's puzzle yet. Run `{} play`.", self.prefix),
             Ok(ShareOutcome::InProgress) => "Finish today's puzzle before sharing your result.".to_string(),
-            Ok(ShareOutcome::Ready(data)) => render::share_text(&player.display_name, &data),
+            Ok(ShareOutcome::Ready(data)) => {
+                let community = self.community(guild).await;
+                render::share_text(&player.display_name, &data, community.as_ref())
+            }
             Err(e) => return self.internal_error(channel, &e).await,
         };
         self.reply(channel, &OutgoingMessage::text(text)).await

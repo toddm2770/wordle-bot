@@ -12,6 +12,7 @@ pub enum Command {
     Leaderboard(LeaderboardSort),
     Mode(GameMode),
     Share,
+    Community,
     Help,
     /// Recognised prefix but unusable arguments; carries a short usage hint.
     Usage(String),
@@ -62,6 +63,7 @@ pub fn parse(content: &str, prefix: &str) -> Option<Command> {
             None => usage(&format!("Usage: `{prefix} mode normal` or `{prefix} mode hard`")),
         },
         "share" => Some(Command::Share),
+        "community" | "server" | "group" | "team" | "streak" => Some(Command::Community),
         "help" | "?" => Some(Command::Help),
         other => usage(&format!("Unknown command `{other}`. Try `{prefix} help`.")),
     }
@@ -107,6 +109,8 @@ mod tests {
         assert_eq!(parse("!wordle leaderboard streak", P), Some(Command::Leaderboard(LeaderboardSort::CurrentStreak)));
         assert_eq!(parse("!wordle mode hard", P), Some(Command::Mode(GameMode::Hard)));
         assert_eq!(parse("!wordle share", P), Some(Command::Share));
+        assert_eq!(parse("!wordle community", P), Some(Command::Community));
+        assert_eq!(parse("!wordle streak", P), Some(Command::Community));
         assert_eq!(parse("!wordle help", P), Some(Command::Help));
     }
 

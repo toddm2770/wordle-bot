@@ -628,9 +628,71 @@ async fn share_only_after_finishing_and_without_letters(pool: PgPool) {
         ShareOutcome::Ready(d) => {
             assert!(d.won);
             assert_eq!((d.guesses_used, d.puzzle_number, d.mode), (2, 2001, GameMode::Hard));
-            let text = wordle_bot::bot::render::share_text("A", &d);
+            let text = wordle_bot::bot::render::share_text("A", &d, None);
             assert!(!text.to_lowercase().contains("cigar") && !text.to_lowercase().contains("crane"));
         }
         other => panic!("expected Ready, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------- community streak
+
+#[sqlx::test(migrator = "wordle_bot::MIGRATOR")]
+async fn community_streak_needs_one_solver_per_day(pool: PgPool) {
+    let solutions: Vec<(NaiveDate, &str)> = (1..=8).map(|d| (day(d), "cigar")).collect();
+    let h = Harness::new(pool, &solutions);
+    let (alice, bob, cara) = (player(1, "Alice"), player(2, "Bob"), player(3, "Cara"));
+
+    let empty = h.svc.community_streak(GUILD_A).await.unwrap();
+    assert_eq!((empty.current, empty.longest), (0, 0));
+    assert!(!empty.safe_today());
+
+    // Day 1: only Alice solves. Day 2: only Bob. Day 3: both solve.
+    h.play_day(&alice, GUILD_A, &["cigar"]).await;
+    h.clock.set_day(day(2));
+    h.play_day(&bob, GUILD_A, &["crane", "cigar"]).await;
+    h.clock.set_day(day(3));
+    h.play_day(&alice, GUILD_A, &["cigar"]).await;
+    h.play_day(&bob, GUILD_A, &["cigar"]).await;
+    let c = h.svc.community_streak(GUILD_A).await.unwrap();
+    assert_eq!((c.current, c.longest), (3, 3));
+    assert_eq!(c.solved_today, vec!["Alice".to_string(), "Bob".to_string()]);
+    assert_eq!(c.puzzle_number, Some(2003));
+
+    // Day 4: Cara loses, nobody solves. A loss doesn't break it, but the day is still open.
+    h.clock.set_day(day(4));
+    h.play_day(&cara, GUILD_A, &LOSING).await;
+    let c = h.svc.community_streak(GUILD_A).await.unwrap();
+    assert_eq!(c.current, 3, "yesterday's streak survives while today is open");
+    assert!(!c.safe_today());
+
+    // Day 5: day 4 passed with no solver, so the streak is broken; longest stays 3.
+    h.clock.set_day(day(5));
+    let c = h.svc.community_streak(GUILD_A).await.unwrap();
+    assert_eq!((c.current, c.longest), (0, 3));
+
+    // Cara solves on day 5 and starts a new streak of 1.
+    h.play_day(&cara, GUILD_A, &["cigar"]).await;
+    let c = h.svc.community_streak(GUILD_A).await.unwrap();
+    assert_eq!((c.current, c.longest, c.solved_today.len()), (1, 3, 1));
+}
+
+#[sqlx::test(migrator = "wordle_bot::MIGRATOR")]
+async fn community_streaks_are_per_community(pool: PgPool) {
+    let h = Harness::new(pool, &[(day(1), "cigar"), (day(2), "cigar")]);
+    h.play_day(&player(1, "A"), GUILD_A, &["cigar"]).await;
+    h.play_day(&player(2, "B"), GUILD_B, &["cigar"]).await;
+    h.clock.set_day(day(2));
+    h.play_day(&player(2, "B"), GUILD_B, &["cigar"]).await;
+
+    let a = h.svc.community_streak(GUILD_A).await.unwrap();
+    let b = h.svc.community_streak(GUILD_B).await.unwrap();
+    assert_eq!((a.current, a.safe_today()), (1, false));
+    assert_eq!((b.current, b.safe_today()), (2, true));
+
+    // The win carries its community so the bot can announce it.
+    h.svc.start_game(&player(1, "A"), Some(GUILD_A), None).await.unwrap();
+    let (view, _) = accepted(h.guess(1, "cigar").await);
+    assert_eq!(view.guild_id, Some(GUILD_A));
+    assert_eq!(h.svc.community_streak(GUILD_A).await.unwrap().current, 2);
 }

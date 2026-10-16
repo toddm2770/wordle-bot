@@ -21,6 +21,7 @@ A NYT-style daily Wordle bot for a self-hosted [Fluxer](https://fluxer.app) inst
 | `!wordle board` | anywhere | Show your current board (always sent to your DM). |
 | `!wordle stats` | anywhere | Played, win %, words solved, streaks, guess distribution. |
 | `!wordle leaderboard [solved\|streak\|longest]` | server channel | This community's rankings (default: words solved). |
+| `!wordle community` (or `!wordle streak`) | server channel | The community streak: days in a row that at least one person here solved the Wordle, and who has solved today. |
 | `!wordle mode normal\|hard` | anywhere | Set your preferred mode. It changes today's game only if you haven't guessed yet. |
 | `!wordle share` | server channel | Post your finished grid: colours only, no letters. |
 | `!wordle help` | anywhere | Command list. |
@@ -75,6 +76,8 @@ tests/service.rs     database integration tests
 | Missed a whole day | 0 once that day is over | unchanged |
 | Started a game but didn't finish it before midnight | treated as a missed day | unchanged |
 | Normal or hard mode win | both count toward the same streak | |
+
+**Community streak.** Each community also has a shared streak: the number of consecutive days on which **at least one person** solved the puzzle from that community. A loss doesn't break it; only a full day with no solves does, and it survives until midnight while today is still open. A win counts for the community the game was started from. It's calculated from game history like personal streaks, and it appears in `!wordle community`, at the top of the leaderboard, in `!wordle share` posts, and in the win message ("you're the first to solve today").
 
 ### Database schema
 

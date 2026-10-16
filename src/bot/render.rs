@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use crate::fluxer::model::{Embed, EmbedField, EmbedFooter, OutgoingMessage};
 use crate::game::{feedback_emoji, GameMode, Tile, MAX_GUESSES, WORD_LEN};
-use crate::service::{GameStatus, GameView, LeaderboardEntry, LeaderboardSort, PlayerStats, Rejection, ShareData};
+use crate::service::{
+    CommunityStreak, GameStatus, GameView, LeaderboardEntry, LeaderboardSort, PlayerStats, Rejection, ShareData,
+};
 
 const GREEN: u32 = 0x6AAA64;
 const YELLOW: u32 = 0xC9B458;
@@ -162,14 +164,28 @@ fn streak_line(stats: &PlayerStats) -> String {
     format!("🔥 Current streak: **{}** · Longest streak: **{}**", stats.current_streak, stats.longest_streak)
 }
 
-pub fn won(view: &GameView, stats: &PlayerStats, prefix: &str) -> OutgoingMessage {
+fn days(n: i32) -> String {
+    if n == 1 { "1 day".into() } else { format!("{n} days") }
+}
+
+/// Line for the win message about the community streak this win counted toward.
+fn community_win_line(c: &CommunityStreak) -> String {
+    if c.solved_today.len() <= 1 {
+        format!("🙌 You're the first to solve today, so the community streak is safe: **{}**!", days(c.current))
+    } else {
+        format!("👥 Community streak: **{}** · {} solved today", days(c.current), c.solved_today.len())
+    }
+}
+
+pub fn won(view: &GameView, stats: &PlayerStats, prefix: &str, community: Option<&CommunityStreak>) -> OutgoingMessage {
     let used = view.guesses.len();
+    let community_line = community.map(|c| format!("\n{}", community_win_line(c))).unwrap_or_default();
     let mut m = board(view, None, prefix);
     let embed = &mut m.embeds[0];
     embed.title = Some(format!("🎉 {} Wordle #{} solved!", praise(used), format_number(view.puzzle_number)));
     embed.color = Some(GREEN);
     embed.description = Some(format!(
-        "Congratulations! You solved it in **{used}/{MAX_GUESSES}**.\n\n{}\n\n{}\n\nUse `{prefix} share` in a server channel to share your result without spoilers.",
+        "Congratulations! You solved it in **{used}/{MAX_GUESSES}**.\n\n{}\n\n{}{community_line}\n\nUse `{prefix} share` in a server channel to share your result without spoilers.",
         grid(view),
         streak_line(stats)
     ));
@@ -255,7 +271,13 @@ fn rank_badge(rank: usize) -> String {
 ///
 /// 🥇 **Alice**
 /// Solved **124** · Streak 18 · Longest 42
-pub fn leaderboard(entries: &[LeaderboardEntry], sort: LeaderboardSort, limit: usize, prefix: &str) -> OutgoingMessage {
+pub fn leaderboard(
+    entries: &[LeaderboardEntry],
+    sort: LeaderboardSort,
+    limit: usize,
+    prefix: &str,
+    community: Option<&CommunityStreak>,
+) -> OutgoingMessage {
     if entries.is_empty() {
         return OutgoingMessage::text(format!("No one has finished a puzzle in this community yet. Start with `{prefix} play`!"));
     }
@@ -277,7 +299,13 @@ pub fn leaderboard(entries: &[LeaderboardEntry], sort: LeaderboardSort, limit: u
             )
         })
         .collect();
-    let mut description = blocks.join("\n\n");
+    let mut description = String::new();
+    if let Some(c) = community {
+        let status = if c.safe_today() { "✅ solved today" } else if c.current > 0 { "⏳ not solved yet today" } else { "" };
+        let sep = if status.is_empty() { "" } else { " · " };
+        description.push_str(&format!("👥 Community streak: **{}**{sep}{status}\n\n", days(c.current)));
+    }
+    description.push_str(&blocks.join("\n\n"));
     if entries.len() > limit {
         description.push_str(&format!("\n\n…and {} more", entries.len() - limit));
     }
@@ -293,16 +321,50 @@ pub fn leaderboard(entries: &[LeaderboardEntry], sort: LeaderboardSort, limit: u
 }
 
 /// Public, spoiler-free result: no letters, only colours.
-pub fn share_text(display_name: &str, data: &ShareData) -> String {
+pub fn share_text(display_name: &str, data: &ShareData, community: Option<&CommunityStreak>) -> String {
     let score = if data.won { data.guesses_used.to_string() } else { "X".into() };
     let star = if data.mode == GameMode::Hard { "*" } else { "" };
     let rows: Vec<String> = data.rows.iter().map(feedback_emoji).collect();
     format!(
-        "**{}**'s Wordle {} {score}/{MAX_GUESSES}{star}\n\n{}",
-        truncate(display_name, 32),
+        "**{}**'s Wordle {} {score}/{MAX_GUESSES}{star}\n\n{}{}",
+        escape_markdown(&truncate(display_name, 32)),
         format_number(data.puzzle_number),
-        rows.join("\n")
+        rows.join("\n"),
+        community
+            .filter(|c| c.current > 0)
+            .map(|c| format!("\n\n👥 Community streak: **{}**", days(c.current)))
+            .unwrap_or_default()
     )
+}
+
+/// `!wordle community`: the shared streak and who has kept it alive today.
+pub fn community_streak(c: &CommunityStreak, prefix: &str) -> OutgoingMessage {
+    let puzzle = c.puzzle_number.map(|n| format!(" (#{})", format_number(n))).unwrap_or_default();
+    let mut description = if c.safe_today() {
+        let names: Vec<String> = c.solved_today.iter().take(15).map(|n| escape_markdown(&truncate(n, 32))).collect();
+        let more = c.solved_today.len().saturating_sub(15);
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        format!(
+            "✅ Today's puzzle{puzzle} has been solved, so the streak is safe.\n\n**Solved today ({}):** {}{more}",
+            c.solved_today.len(),
+            names.join(", ")
+        )
+    } else if c.current > 0 {
+        format!(
+            "⏳ Nobody has solved today's puzzle{puzzle} yet. Solve it before midnight (America/New_York) to keep the **{}** streak alive!",
+            days(c.current)
+        )
+    } else {
+        format!("No streak right now. Solve today's puzzle{puzzle} to start one!")
+    };
+    description.push_str(&format!("\n\nThe streak grows each day at least one person here solves the Wordle. Play with `{prefix} play`."));
+    OutgoingMessage::embed(Embed {
+        title: Some(format!("👥 Community streak: {}", days(c.current))),
+        description: Some(description),
+        color: Some(if c.safe_today() { GREEN } else { YELLOW }),
+        footer: Some(EmbedFooter { text: format!("Longest community streak: {}", days(c.longest)) }),
+        fields: Vec::new(),
+    })
 }
 
 pub fn help(prefix: &str) -> OutgoingMessage {
@@ -317,6 +379,7 @@ pub fn help(prefix: &str) -> OutgoingMessage {
              `{p} board` — show your current board\n\
              `{p} stats` — your statistics\n\
              `{p} leaderboard [solved|streak|longest]` — this community's rankings\n\
+             `{p} community` — the community streak: days in a row someone here solved the Wordle\n\
              `{p} mode normal|hard` — set your preferred mode (locks once your first guess is accepted)\n\
              `{p} share` — post your finished result without spoilers\n\n\
              **Hard mode:** revealed green letters must stay in place and revealed yellow letters must be reused.",
@@ -341,6 +404,7 @@ mod tests {
             puzzle_number: 1000,
             mode: GameMode::Hard,
             status,
+            guild_id: Some(1000),
             guesses: words
                 .iter()
                 .map(|w| Guess { word: w.to_string(), feedback: evaluate(w, solution) })
@@ -414,7 +478,7 @@ mod tests {
             longest_streak: 3,
             distribution: [0, 3, 0, 0, 0, 0],
         };
-        let t = won(&v, &stats, "!wordle").to_plain_text();
+        let t = won(&v, &stats, "!wordle", None).to_plain_text();
         assert!(t.contains("Congratulations") && t.contains("2/6") && t.contains("**3**"));
     }
 
@@ -428,7 +492,7 @@ mod tests {
             guesses_used: 2,
             rows: v.guesses.iter().map(|g| g.feedback).collect(),
         };
-        let t = share_text("Alice", &data);
+        let t = share_text("Alice", &data, None);
         assert!(t.contains("Wordle 1,000 2/6*"));
         assert!(!t.to_lowercase().contains("crane") && !t.to_lowercase().contains("cigar"));
         assert!(t.contains("🟩"));
@@ -437,8 +501,8 @@ mod tests {
     #[test]
     fn share_text_for_loss_uses_x() {
         let data = ShareData { puzzle_number: 5, mode: GameMode::Normal, won: false, guesses_used: 6, rows: vec![] };
-        assert!(share_text("Bob", &data).contains("X/6"));
-        assert!(!share_text("Bob", &data).contains("X/6*"));
+        assert!(share_text("Bob", &data, None).contains("X/6"));
+        assert!(!share_text("Bob", &data, None).contains("X/6*"));
     }
 
     fn lb_entry(rank: usize, id: i64, name: &str, solved: i32, current: i32, longest: i32) -> LeaderboardEntry {
@@ -448,7 +512,7 @@ mod tests {
     #[test]
     fn leaderboard_shows_all_three_stats() {
         let entries = vec![lb_entry(1, 1, "Alice", 124, 18, 42), lb_entry(2, 2, "Bob", 107, 7, 29)];
-        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle").to_plain_text();
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle", None).to_plain_text();
         assert!(t.contains("🥇 **Alice**\nSolved **124** · Streak 18 · Longest 42"), "{t}");
         assert!(t.contains("🥈 **Bob**\nSolved **107** · Streak 7 · Longest 29"), "{t}");
     }
@@ -456,7 +520,7 @@ mod tests {
     #[test]
     fn leaderboard_is_narrow_enough_for_phones() {
         let entries = vec![lb_entry(1, 1, "Squeekienuts", 1234, 123, 456)];
-        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle").to_plain_text();
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle", None).to_plain_text();
         assert!(!t.contains("```"), "no fixed-width table");
         for line in t.lines() {
             assert!(line.chars().count() <= 48, "line too wide for mobile: {line}");
@@ -471,7 +535,7 @@ mod tests {
             lb_entry(1, 3, "wudigen", 2, 2, 2),
             lb_entry(2, 4, "whit", 1, 1, 1),
         ];
-        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle").to_plain_text();
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle", None).to_plain_text();
         assert_eq!(t.matches("🥇").count(), 3);
         assert!(t.contains("🥈 **whit**"));
         assert!(!t.contains("#4"));
@@ -480,18 +544,69 @@ mod tests {
     #[test]
     fn leaderboard_bolds_the_sorted_stat() {
         let entries = vec![lb_entry(1, 1, "A", 5, 3, 9)];
-        let t = leaderboard(&entries, LeaderboardSort::LongestStreak, 15, "!wordle").to_plain_text();
+        let t = leaderboard(&entries, LeaderboardSort::LongestStreak, 15, "!wordle", None).to_plain_text();
         assert!(t.contains("Solved 5 · Streak 3 · Longest **9**"), "{t}");
-        assert!(t.contains("#4") == false && t.contains("by Longest Streak"));
+        assert!(!t.contains("#4") && t.contains("by Longest Streak"));
     }
 
     #[test]
     fn leaderboard_respects_limit_and_escapes_names() {
         let entries: Vec<_> = (1..=5).map(|i| lb_entry(i, i as i64, &format!("p_{i}*"), 1, 0, 1)).collect();
-        let t = leaderboard(&entries, LeaderboardSort::Solved, 3, "!wordle").to_plain_text();
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 3, "!wordle", None).to_plain_text();
         assert!(t.contains("p\\_1\\*") && t.contains("p\\_3\\*") && !t.contains("p\\_4"));
         assert!(t.contains("…and 2 more"));
-        assert!(t.contains("**#4**") == false);
+        assert!(!t.contains("**#4**"));
+    }
+
+    fn community(current: i32, longest: i32, solvers: &[&str]) -> CommunityStreak {
+        CommunityStreak {
+            current,
+            longest,
+            puzzle_number: Some(1945),
+            solved_today: solvers.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn community_streak_message_states() {
+        let safe = community_streak(&community(12, 30, &["Alice", "Bob"]), "!wordle").to_plain_text();
+        assert!(safe.contains("Community streak: 12 days") && safe.contains("safe") && safe.contains("Alice, Bob"));
+        assert!(safe.contains("Longest community streak: 30 days"));
+
+        let at_risk = community_streak(&community(12, 30, &[]), "!wordle").to_plain_text();
+        assert!(at_risk.contains("Nobody has solved") && at_risk.contains("12 days") && at_risk.contains("#1,945"));
+
+        let none = community_streak(&community(0, 3, &[]), "!wordle").to_plain_text();
+        assert!(none.contains("No streak right now") && none.contains("start one"));
+        assert!(community_streak(&community(1, 1, &["A"]), "!wordle").to_plain_text().contains("1 day"));
+    }
+
+    #[test]
+    fn win_message_mentions_community_streak() {
+        let v = view(&["cigar"], "cigar", GameStatus::Won);
+        let stats = PlayerStats {
+            display_name: "x".into(),
+            games_played: 1,
+            games_won: 1,
+            current_streak: 1,
+            longest_streak: 1,
+            distribution: [1, 0, 0, 0, 0, 0],
+        };
+        let first = won(&v, &stats, "!wordle", Some(&community(5, 5, &["x"]))).to_plain_text();
+        assert!(first.contains("first to solve today") && first.contains("5 days"), "{first}");
+        let later = won(&v, &stats, "!wordle", Some(&community(5, 5, &["a", "x"]))).to_plain_text();
+        assert!(later.contains("Community streak: **5 days** · 2 solved today"), "{later}");
+        assert!(!won(&v, &stats, "!wordle", None).to_plain_text().contains("Community"));
+    }
+
+    #[test]
+    fn leaderboard_and_share_show_community_streak() {
+        let entries = vec![lb_entry(1, 1, "A", 1, 1, 1)];
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle", Some(&community(7, 9, &[]))).to_plain_text();
+        assert!(t.contains("Community streak: **7 days** · ⏳ not solved yet today"), "{t}");
+        let data = ShareData { puzzle_number: 5, mode: GameMode::Normal, won: true, guesses_used: 3, rows: vec![] };
+        assert!(share_text("A", &data, Some(&community(7, 9, &["A"]))).contains("Community streak: **7 days**"));
+        assert!(!share_text("A", &data, Some(&community(0, 9, &[]))).contains("Community"));
     }
 
     #[test]
