@@ -172,7 +172,8 @@ pub struct LeaderboardEntry {
     pub longest_streak: i32,
 }
 
-/// Sort entries for `sort`; players tied on the whole sort key share a rank.
+/// Sort entries for `sort`. Players tied on the whole sort key share a rank, and
+/// the next distinct score takes the next rank (dense ranking: 1, 1, 1, 2).
 pub fn rank_entries(mut entries: Vec<LeaderboardEntry>, sort: LeaderboardSort) -> Vec<LeaderboardEntry> {
     let key = |e: &LeaderboardEntry| match sort {
         LeaderboardSort::Solved => (e.solved, e.longest_streak, e.current_streak),
@@ -185,10 +186,15 @@ pub fn rank_entries(mut entries: Vec<LeaderboardEntry>, sort: LeaderboardSort) -
             .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()))
             .then_with(|| a.user_id.cmp(&b.user_id))
     });
-    let keys: Vec<_> = entries.iter().map(&key).collect();
-    for (i, entry) in entries.iter_mut().enumerate() {
-        let better = keys.iter().filter(|k| **k > keys[i]).count();
-        entry.rank = better + 1;
+    let mut rank = 0;
+    let mut previous = None;
+    for entry in entries.iter_mut() {
+        let k = key(entry);
+        if previous != Some(k) {
+            rank += 1;
+            previous = Some(k);
+        }
+        entry.rank = rank;
     }
     entries
 }
@@ -687,7 +693,7 @@ mod tests {
             vec![entry(2, "bob", 5, 1, 2), entry(1, "Alice", 5, 1, 2), entry(3, "Cy", 4, 0, 1)],
             LeaderboardSort::Solved,
         );
-        assert_eq!(ranked.iter().map(|e| e.rank).collect::<Vec<_>>(), vec![1, 1, 3]);
+        assert_eq!(ranked.iter().map(|e| e.rank).collect::<Vec<_>>(), vec![1, 1, 2]);
         assert_eq!(ranked[0].display_name, "Alice");
     }
 

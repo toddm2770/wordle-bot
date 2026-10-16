@@ -230,28 +230,63 @@ fn truncate(name: &str, max: usize) -> String {
     }
 }
 
+/// Escape Markdown so a display name like `*bob*` or `__x__` shows literally.
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '*' | '_' | '~' | '`' | '|' | '>' | '[' | ']' | '(' | ')' | '#' | '-') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn rank_badge(rank: usize) -> String {
+    match rank {
+        1 => "🥇".into(),
+        2 => "🥈".into(),
+        3 => "🥉".into(),
+        n => format!("**#{n}**"),
+    }
+}
+
+/// One short block per player so it reads well on narrow phone screens:
+///
+/// 🥇 **Alice**
+/// Solved **124** · Streak 18 · Longest 42
 pub fn leaderboard(entries: &[LeaderboardEntry], sort: LeaderboardSort, limit: usize, prefix: &str) -> OutgoingMessage {
     if entries.is_empty() {
         return OutgoingMessage::text(format!("No one has finished a puzzle in this community yet. Start with `{prefix} play`!"));
     }
-    let name_w = entries.iter().take(limit).map(|e| truncate(&e.display_name, 16).chars().count()).max().unwrap_or(6).max(6);
-    let mut table = format!("{:<4} {:<name_w$}  {:>6}  {:>7}  {:>7}\n", "Rank", "Player", "Solved", "Current", "Longest");
-    for e in entries.iter().take(limit) {
-        table.push_str(&format!(
-            "{:<4} {:<name_w$}  {:>6}  {:>7}  {:>7}\n",
-            e.rank,
-            truncate(&e.display_name, 16),
-            e.solved,
-            e.current_streak,
-            e.longest_streak
-        ));
+    // The stat being ranked by is shown in bold.
+    let stat = |label: &str, value: i32, active: bool| {
+        if active { format!("{label} **{value}**") } else { format!("{label} {value}") }
+    };
+    let blocks: Vec<String> = entries
+        .iter()
+        .take(limit)
+        .map(|e| {
+            format!(
+                "{} **{}**\n{} · {} · {}",
+                rank_badge(e.rank),
+                escape_markdown(&truncate(&e.display_name, 32)),
+                stat("Solved", e.solved, sort == LeaderboardSort::Solved),
+                stat("Streak", e.current_streak, sort == LeaderboardSort::CurrentStreak),
+                stat("Longest", e.longest_streak, sort == LeaderboardSort::LongestStreak),
+            )
+        })
+        .collect();
+    let mut description = blocks.join("\n\n");
+    if entries.len() > limit {
+        description.push_str(&format!("\n\n…and {} more", entries.len() - limit));
     }
     OutgoingMessage::embed(Embed {
         title: Some(format!("🏆 Wordle leaderboard — by {}", sort.label())),
-        description: Some(format!("```\n{table}```")),
+        description: Some(description),
         color: Some(GREEN),
         footer: Some(EmbedFooter {
-            text: format!("Sort with {prefix} leaderboard [solved|streak|longest]"),
+            text: format!("Also try: {prefix} leaderboard streak / longest"),
         }),
         fields: Vec::new(),
     })
@@ -406,32 +441,57 @@ mod tests {
         assert!(!share_text("Bob", &data).contains("X/6*"));
     }
 
-    #[test]
-    fn leaderboard_shows_all_three_stats() {
-        let entries = vec![
-            LeaderboardEntry { rank: 1, user_id: 1, display_name: "Alice".into(), solved: 124, current_streak: 18, longest_streak: 42 },
-            LeaderboardEntry { rank: 2, user_id: 2, display_name: "Bob".into(), solved: 107, current_streak: 7, longest_streak: 29 },
-        ];
-        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle").to_plain_text();
-        assert!(t.contains("Solved") && t.contains("Current") && t.contains("Longest"));
-        assert!(t.contains("Alice") && t.contains("124") && t.contains("18") && t.contains("42"));
+    fn lb_entry(rank: usize, id: i64, name: &str, solved: i32, current: i32, longest: i32) -> LeaderboardEntry {
+        LeaderboardEntry { rank, user_id: id, display_name: name.into(), solved, current_streak: current, longest_streak: longest }
     }
 
     #[test]
-    fn leaderboard_respects_limit_and_sanitises_names() {
-        let entries: Vec<_> = (1..=5)
-            .map(|i| LeaderboardEntry {
-                rank: i,
-                user_id: i as i64,
-                display_name: format!("p`{i}"),
-                solved: 1,
-                current_streak: 0,
-                longest_streak: 1,
-            })
-            .collect();
+    fn leaderboard_shows_all_three_stats() {
+        let entries = vec![lb_entry(1, 1, "Alice", 124, 18, 42), lb_entry(2, 2, "Bob", 107, 7, 29)];
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle").to_plain_text();
+        assert!(t.contains("🥇 **Alice**\nSolved **124** · Streak 18 · Longest 42"), "{t}");
+        assert!(t.contains("🥈 **Bob**\nSolved **107** · Streak 7 · Longest 29"), "{t}");
+    }
+
+    #[test]
+    fn leaderboard_is_narrow_enough_for_phones() {
+        let entries = vec![lb_entry(1, 1, "Squeekienuts", 1234, 123, 456)];
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle").to_plain_text();
+        assert!(!t.contains("```"), "no fixed-width table");
+        for line in t.lines() {
+            assert!(line.chars().count() <= 48, "line too wide for mobile: {line}");
+        }
+    }
+
+    #[test]
+    fn tied_players_share_a_medal_and_the_next_player_is_second() {
+        let entries = vec![
+            lb_entry(1, 1, "cg2sy", 2, 2, 2),
+            lb_entry(1, 2, "Squeekienuts", 2, 2, 2),
+            lb_entry(1, 3, "wudigen", 2, 2, 2),
+            lb_entry(2, 4, "whit", 1, 1, 1),
+        ];
+        let t = leaderboard(&entries, LeaderboardSort::Solved, 15, "!wordle").to_plain_text();
+        assert_eq!(t.matches("🥇").count(), 3);
+        assert!(t.contains("🥈 **whit**"));
+        assert!(!t.contains("#4"));
+    }
+
+    #[test]
+    fn leaderboard_bolds_the_sorted_stat() {
+        let entries = vec![lb_entry(1, 1, "A", 5, 3, 9)];
+        let t = leaderboard(&entries, LeaderboardSort::LongestStreak, 15, "!wordle").to_plain_text();
+        assert!(t.contains("Solved 5 · Streak 3 · Longest **9**"), "{t}");
+        assert!(t.contains("#4") == false && t.contains("by Longest Streak"));
+    }
+
+    #[test]
+    fn leaderboard_respects_limit_and_escapes_names() {
+        let entries: Vec<_> = (1..=5).map(|i| lb_entry(i, i as i64, &format!("p_{i}*"), 1, 0, 1)).collect();
         let t = leaderboard(&entries, LeaderboardSort::Solved, 3, "!wordle").to_plain_text();
-        assert!(t.contains("p1") && t.contains("p3") && !t.contains("p4"));
-        assert_eq!(t.matches('`').count(), 6, "only the code fence backticks may remain");
+        assert!(t.contains("p\\_1\\*") && t.contains("p\\_3\\*") && !t.contains("p\\_4"));
+        assert!(t.contains("…and 2 more"));
+        assert!(t.contains("**#4**") == false);
     }
 
     #[test]
