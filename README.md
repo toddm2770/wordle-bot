@@ -39,20 +39,6 @@ Private things (boards, help, usage hints) always go to DMs. If a DM can't be de
 
 It also catches up at startup if the bot was offline at midnight. To keep individual posts instead, set `COMPACT_RESULTS=false`.
 
----|---|---|
-| `!wordle play` | server channel | Start or resume today's game (in your preferred mode). The board arrives in your DMs. |
-| `!wordle play hard` / `!wordle play normal` | server channel | Start today's game in a specific mode (only until your first guess is accepted). |
-| `!wordle guess CRANE` | DM | Submit a guess. In the DM you can also just type `crane`. |
-| `!wordle board` | anywhere | Show your current board (always sent to your DM). |
-| `!wordle stats` | anywhere | Played, win %, words solved, streaks, guess distribution. |
-| `!wordle leaderboard [solved\|streak\|longest]` | server channel | This community's rankings (default: words solved). |
-| `!wordle community` (or `!wordle streak`) | server channel | The community streak: days in a row that at least one person here solved the Wordle, and who has solved today. |
-| `!wordle mode normal\|hard` | anywhere | Set your preferred mode. It changes today's game only if you haven't guessed yet. |
-| `!wordle share` | server channel | Post your finished grid: colours only, no letters. |
-| `!wordle help` | anywhere | Command list. |
-
-If someone types a guess in a public channel, the bot deletes it (with Manage Messages) and doesn't count it. If a player's privacy settings block DMs from the bot, it tells them how to fix that and never shows the board publicly.
-
 ---
 
 ## How it fits together
@@ -64,7 +50,7 @@ src/
   game.rs            pure Wordle rules: scoring, hard mode, dictionary
   streaks.rs         pure streak maths, recomputed from game history
   puzzle.rs          WordProvider trait, NYT provider, PostgreSQL puzzle cache, midnight prefetch
-  service.rs         game orchestration in SQL transactions (start, guess, stats, leaderboard, share)
+  service.rs         game orchestration in SQL transactions (start, guess, stats, leaderboard, results, recaps)
   bot/               command parsing, message rendering, command handling
   fluxer/            Fluxer integration: endpoint discovery, REST client, gateway client, preflight
 migrations/          SQL migrations (applied automatically on startup)
@@ -102,7 +88,7 @@ tests/service.rs     database integration tests
 | Started a game but didn't finish it before midnight | treated as a missed day | unchanged |
 | Normal or hard mode win | both count toward the same streak | |
 
-**Community streak.** Each community also has a shared streak: the number of consecutive days on which **at least one person** solved the puzzle from that community. A loss doesn't break it; only a full day with no solves does, and it survives until midnight while today is still open. A win counts for the community the game was started from. It's calculated from game history like personal streaks, and it appears in `!wordle community`, at the top of the leaderboard, in `!wordle share` posts, and in the win message ("you're the first to solve today").
+**Community streak.** Each community also has a shared streak: the number of consecutive days on which **at least one person** solved the puzzle from that community. A loss doesn't break it; only a full day with no solves does, and it survives until midnight while today is still open. A win counts for the community the game was started from. It's calculated from game history like personal streaks, and it appears in `!wordle community`, at the top of the leaderboard, in the automatic result posts and daily recap, and in the win message ("you're the first to solve today").
 
 ### Database schema
 
