@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::endpoints::Endpoints;
-use super::model::{BotApplication, OutgoingMessage};
+use super::model::{BotApplication, GuildStub, OutgoingMessage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -150,9 +150,20 @@ impl RestClient {
             .map_err(|e| ApiError::Transport(format!("unexpected channel payload: {e}")))
     }
 
-    /// `POST /v1/channels/{id}/messages`. Retries on 429/5xx/transport errors
-    /// reusing one nonce, so Fluxer replays the first result instead of posting twice.
-    pub async fn send_message(&self, channel_id: &str, message: &OutgoingMessage) -> Result<(), ApiError> {
+    /// `GET /v1/guilds/{id}`: used for the community's `owner_id`.
+    pub async fn get_guild(&self, guild_id: &str) -> Result<GuildStub, ApiError> {
+        let url = self.endpoints.api_url(&format!("guilds/{guild_id}"));
+        let (status, body) = self.send(self.http.get(&url)).await?;
+        if !status.is_success() {
+            return Err(Self::to_error(status, &body).0);
+        }
+        serde_json::from_str(&body).map_err(|e| ApiError::Transport(format!("unexpected guild payload: {e}")))
+    }
+
+    /// `POST /v1/channels/{id}/messages`, returning the new message's ID. Retries on
+    /// 429/5xx/transport errors reusing one nonce, so Fluxer replays the first result
+    /// instead of posting twice.
+    pub async fn send_message(&self, channel_id: &str, message: &OutgoingMessage) -> Result<String, ApiError> {
         let url = self.endpoints.api_url(&format!("channels/{channel_id}/messages"));
         let mut payload = serde_json::to_value(message).map_err(|e| ApiError::Transport(e.to_string()))?;
         payload["nonce"] = json!(random_nonce());
@@ -162,7 +173,13 @@ impl RestClient {
         loop {
             let result = self.send(self.http.post(&url).json(&payload)).await;
             let (err, wait) = match result {
-                Ok((status, _)) if status.is_success() => return Ok(()),
+                Ok((status, body)) if status.is_success() => {
+                    #[derive(Deserialize)]
+                    struct Created {
+                        id: String,
+                    }
+                    return Ok(serde_json::from_str::<Created>(&body).map(|c| c.id).unwrap_or_default());
+                }
                 Ok((status, body)) => {
                     let (err, retry_after) = Self::to_error(status, &body);
                     let retryable = status.as_u16() == 429 || status.is_server_error();

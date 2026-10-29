@@ -13,8 +13,33 @@ A NYT-style daily Wordle bot for a self-hosted [Fluxer](https://fluxer.app) inst
 
 ## Commands
 
+**The everyday flow:** type `!wordle play` in a server channel once. The puzzle arrives in your DMs and nothing is posted in the channel. Type your guesses in the DM. When you finish, your spoiler-free grid is posted in the server automatically. On later days, just type a word in the same DM to play that day's puzzle.
+
 | Command | Where | What it does |
 |---|---|---|
+| `!wordle play` / `!wordle play hard` | server channel or DM | Start or resume today's game (optionally in hard mode, until your first guess). The board is sent by DM. |
+| *a five-letter word* (or `!wordle guess CRANE`) | DM | Submit a guess. If you have no game today, one starts automatically for the community you last played from. |
+| `!wordle board` | anywhere | Your current board, sent by DM. |
+| `!wordle stats` | anywhere | Played, win %, words solved, streaks, guess distribution. |
+| `!wordle leaderboard [solved\|streak\|longest]` | server channel | This community's rankings, with the community streak at the top. |
+| `!wordle community` (or `!wordle streak`) | server channel | The community streak: days in a row that at least one person here solved the Wordle, and who has solved today. |
+| `!wordle mode normal\|hard` | anywhere | Set your preferred mode (reply by DM). |
+| `!wordle channel` / `!wordle channel reset` | server channel | **Community owner (or the bot's owner) only.** Post all results in this channel, or go back to posting in the channel where each player last ran `play`. |
+| `!wordle help` | anywhere | Command list, sent by DM. |
+
+Private things (boards, help, usage hints) always go to DMs. If a DM can't be delivered, the bot posts a short notice in the channel without any private content, because that's the only way to tell the player. Guesses typed in a public channel are deleted (with Manage Messages) and not counted.
+
+**Daily recap.** Shortly after midnight (America/New_York), the bot replaces the previous day's individual result posts with one compact recap per channel, for example:
+
+> 📅 **Wordle #1,958 results**
+> 👥 Community streak: **12 days**
+> 👑 **2/6** · Alice
+> **3/6** · Bob, Cara\*
+> **X/6** · Dave
+
+It also catches up at startup if the bot was offline at midnight. To keep individual posts instead, set `COMPACT_RESULTS=false`.
+
+---|---|---|
 | `!wordle play` | server channel | Start or resume today's game (in your preferred mode). The board arrives in your DMs. |
 | `!wordle play hard` / `!wordle play normal` | server channel | Start today's game in a specific mode (only until your first guess is accepted). |
 | `!wordle guess CRANE` | DM | Submit a guess. In the DM you can also just type `crane`. |

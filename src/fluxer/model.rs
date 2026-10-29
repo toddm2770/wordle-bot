@@ -82,6 +82,8 @@ pub struct GuildStub {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
     pub unavailable: Option<bool>,
 }
 
@@ -92,6 +94,9 @@ pub struct BotApplication {
     pub name: String,
     #[serde(default)]
     pub bot_public: bool,
+    /// The account that owns the application (allowed to change bot settings).
+    #[serde(default)]
+    pub owner: Option<User>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

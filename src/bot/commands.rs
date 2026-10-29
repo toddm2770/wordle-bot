@@ -3,6 +3,14 @@
 use crate::game::GameMode;
 use crate::service::LeaderboardSort;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChannelAction {
+    /// Post results in the channel the command was sent from.
+    SetHere,
+    /// Go back to posting where each player last ran `play`.
+    Clear,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Play(Option<GameMode>),
@@ -13,6 +21,7 @@ pub enum Command {
     Mode(GameMode),
     Share,
     Community,
+    Channel(ChannelAction),
     Help,
     /// Recognised prefix but unusable arguments; carries a short usage hint.
     Usage(String),
@@ -64,6 +73,12 @@ pub fn parse(content: &str, prefix: &str) -> Option<Command> {
         },
         "share" => Some(Command::Share),
         "community" | "server" | "group" | "team" | "streak" => Some(Command::Community),
+        "channel" | "setchannel" => match arg.map(|a| a.to_ascii_lowercase()) {
+            None => Some(Command::Channel(ChannelAction::SetHere)),
+            Some(a) if matches!(a.as_str(), "here" | "set" | "this") => Some(Command::Channel(ChannelAction::SetHere)),
+            Some(a) if matches!(a.as_str(), "reset" | "clear" | "off" | "none") => Some(Command::Channel(ChannelAction::Clear)),
+            Some(_) => usage(&format!("Usage: `{prefix} channel` (use this channel) or `{prefix} channel reset`")),
+        },
         "help" | "?" => Some(Command::Help),
         other => usage(&format!("Unknown command `{other}`. Try `{prefix} help`.")),
     }
@@ -111,6 +126,10 @@ mod tests {
         assert_eq!(parse("!wordle share", P), Some(Command::Share));
         assert_eq!(parse("!wordle community", P), Some(Command::Community));
         assert_eq!(parse("!wordle streak", P), Some(Command::Community));
+        assert_eq!(parse("!wordle channel", P), Some(Command::Channel(ChannelAction::SetHere)));
+        assert_eq!(parse("!wordle channel here", P), Some(Command::Channel(ChannelAction::SetHere)));
+        assert_eq!(parse("!wordle channel reset", P), Some(Command::Channel(ChannelAction::Clear)));
+        assert!(matches!(parse("!wordle channel bogus", P), Some(Command::Usage(_))));
         assert_eq!(parse("!wordle help", P), Some(Command::Help));
     }
 

@@ -10,6 +10,8 @@ pub enum Error {
     Database(#[from] sqlx::Error),
     #[error("today's puzzle is unavailable: {0}")]
     PuzzleUnavailable(String),
+    #[error("player has not started a game from any community yet")]
+    NoHomeCommunity,
     #[error("{0}")]
     Internal(String),
 }

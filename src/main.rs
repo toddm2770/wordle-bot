@@ -6,7 +6,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tracing_subscriber::EnvFilter;
 
-use wordle_bot::bot::Bot;
+use wordle_bot::bot::{Bot, BotOptions};
 use wordle_bot::config::Config;
 use wordle_bot::fluxer::gateway::{self, GatewayConfig};
 use wordle_bot::fluxer::preflight::{self, PreflightReport};
@@ -103,6 +103,7 @@ async fn run(check_only: bool) -> anyhow::Result<()> {
     let puzzles = Arc::new(PuzzleService::new(pool.clone(), provider));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let prefetch_task = tokio::spawn(prefetch_loop(puzzles.clone(), clock.clone(), config.timezone));
+    let clock_for_recaps = clock.clone();
     let service = Arc::new(GameService::new(
         pool.clone(),
         puzzles,
@@ -111,7 +112,30 @@ async fn run(check_only: bool) -> anyhow::Result<()> {
         config.timezone,
     ));
     let rest = RestClient::new(http, report.endpoints.clone(), &config.bot_token);
-    let bot = Arc::new(Bot::new(rest, service, config.command_prefix.clone(), config.leaderboard_size));
+    let app_owner_id = report.application.owner.as_ref().and_then(|o| o.id_i64());
+    let bot = Arc::new(Bot::new(
+        rest,
+        service,
+        BotOptions {
+            prefix: config.command_prefix.clone(),
+            leaderboard_size: config.leaderboard_size,
+            compact_results: config.compact_results,
+            app_owner_id,
+        },
+    ));
+    // Daily recap: at startup (catches up after downtime) and shortly after each rollover.
+    let recap_task = {
+        let bot = bot.clone();
+        let clock = clock_for_recaps.clone();
+        let tz = config.timezone;
+        tokio::spawn(async move {
+            loop {
+                bot.run_recaps().await;
+                let wait = wordle_bot::puzzle::until_next_rollover(clock.now(), tz) + Duration::from_secs(30);
+                tokio::time::sleep(wait).await;
+            }
+        })
+    };
 
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -149,6 +173,7 @@ async fn run(check_only: bool) -> anyhow::Result<()> {
         Err(_) => tracing::warn!("gateway task did not stop in time"),
     }
     prefetch_task.abort();
+    recap_task.abort();
     pool.close().await;
     Ok(())
 }

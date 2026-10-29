@@ -17,6 +17,8 @@ pub struct Config {
     pub nyt_base_url: String,
     pub words_file: Option<PathBuf>,
     pub leaderboard_size: usize,
+    /// Replace each day's individual result posts with one recap after midnight.
+    pub compact_results: bool,
 }
 
 // Hand-written so the token and database password never reach the logs.
@@ -67,6 +69,13 @@ impl Config {
             None => 15,
         };
 
+        let compact_results = match val("COMPACT_RESULTS").map(|v| v.to_ascii_lowercase()) {
+            None => true,
+            Some(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => true,
+            Some(v) if matches!(v.as_str(), "0" | "false" | "no" | "off") => false,
+            Some(_) => return Err(Error::Config("COMPACT_RESULTS must be true or false".into())),
+        };
+
         Ok(Config {
             bot_token,
             endpoints: EndpointConfig {
@@ -80,6 +89,7 @@ impl Config {
             nyt_base_url: val("NYT_WORDLE_URL").unwrap_or_else(|| "https://www.nytimes.com/svc/wordle/v2".into()),
             words_file: val("WORDS_FILE").map(PathBuf::from),
             leaderboard_size,
+            compact_results,
         })
     }
 }
@@ -102,6 +112,7 @@ mod tests {
         assert_eq!(c.timezone, chrono_tz::America::New_York);
         assert_eq!(c.command_prefix, "!wordle");
         assert_eq!(c.leaderboard_size, 15);
+        assert!(c.compact_results);
     }
 
     #[test]

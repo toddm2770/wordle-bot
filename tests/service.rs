@@ -23,7 +23,7 @@ use wordle_bot::error::Error;
 use wordle_bot::game::{Dictionary, GameMode, HardModeViolation, Tile};
 use wordle_bot::puzzle::{Clock, ProviderError, ProviderPuzzle, PuzzleService, WordProvider};
 use wordle_bot::service::{
-    GameService, GameStatus, GuessOutcome, LeaderboardSort, Player, Rejection, ShareOutcome,
+    GameService, GameStatus, GuessOutcome, LeaderboardSort, Origin, Player, Rejection, ShareOutcome,
 };
 
 const WORDS: &str = "crane\nslate\ncigar\nrebut\nsissy\nhumph\nawake\nblush\nfocal\nevade\nnaval\nserve\nheath\ndwarf\nmodel\nkarma\nstink\ngrade\nquiet\nbench\nabate\nfeign\nmajor\ndeath\nfresh\ncrust\nstool\ncolon\nabase\nmarry\nreact\ntrace\ncrate\nfuzzy\nmummy\npious\nradio\ntrain\nbrain\ngrain\ndrain\nstain\n";
@@ -695,4 +695,101 @@ async fn community_streaks_are_per_community(pool: PgPool) {
     let (view, _) = accepted(h.guess(1, "cigar").await);
     assert_eq!(view.guild_id, Some(GUILD_A));
     assert_eq!(h.svc.community_streak(GUILD_A).await.unwrap().current, 2);
+}
+
+// ---------------------------------------------------------------- DM play, results channel, recaps
+
+fn from_channel(guild_id: i64, channel_id: i64) -> Origin {
+    Origin::Server { guild_id, channel_id: Some(channel_id) }
+}
+
+#[sqlx::test(migrator = "wordle_bot::MIGRATOR")]
+async fn later_days_can_start_from_the_dm(pool: PgPool) {
+    let h = Harness::new(pool, &[(day(1), "cigar"), (day(2), "crane")]);
+    let p = player(1, "A");
+
+    // Never played from a server: there is no community to credit.
+    assert!(matches!(h.svc.start_game_at(&p, Origin::Dm, None).await, Err(Error::NoHomeCommunity)));
+
+    let first = h.svc.start_game_at(&p, from_channel(GUILD_A, 77), Some(GameMode::Hard)).await.unwrap();
+    assert_eq!((first.view.guild_id, first.view.channel_id), (Some(GUILD_A), Some(77)));
+    accepted(h.guess(1, "cigar").await);
+
+    // Next day, from the DM: same community and channel, preferred mode.
+    h.clock.set_day(day(2));
+    h.svc.set_preferred_mode(&p, GameMode::Hard).await.unwrap();
+    let next = h.svc.start_game_at(&p, Origin::Dm, None).await.unwrap();
+    assert!(next.created);
+    assert_eq!((next.view.guild_id, next.view.channel_id, next.view.mode), (Some(GUILD_A), Some(77), GameMode::Hard));
+}
+
+#[sqlx::test(migrator = "wordle_bot::MIGRATOR")]
+async fn home_follows_the_last_server_channel(pool: PgPool) {
+    let h = Harness::new(pool, &[(day(1), "cigar"), (day(2), "cigar"), (day(3), "cigar")]);
+    let p = player(1, "A");
+    h.svc.start_game_at(&p, from_channel(GUILD_A, 10), None).await.unwrap();
+    h.clock.set_day(day(2));
+    h.svc.start_game_at(&p, from_channel(GUILD_B, 20), None).await.unwrap();
+    h.clock.set_day(day(3));
+    let v = h.svc.start_game_at(&p, Origin::Dm, None).await.unwrap().view;
+    assert_eq!((v.guild_id, v.channel_id), (Some(GUILD_B), Some(20)));
+}
+
+#[sqlx::test(migrator = "wordle_bot::MIGRATOR")]
+async fn results_channel_can_be_set_and_cleared(pool: PgPool) {
+    let h = Harness::new(pool, &[(day(1), "cigar")]);
+    assert_eq!(h.svc.results_channel(GUILD_A).await.unwrap(), None);
+    h.svc.set_results_channel(GUILD_A, Some(555), 1).await.unwrap();
+    assert_eq!(h.svc.results_channel(GUILD_A).await.unwrap(), Some(555));
+    assert_eq!(h.svc.results_channel(GUILD_B).await.unwrap(), None);
+    h.svc.set_results_channel(GUILD_A, None, 1).await.unwrap();
+    assert_eq!(h.svc.results_channel(GUILD_A).await.unwrap(), None);
+}
+
+#[sqlx::test(migrator = "wordle_bot::MIGRATOR")]
+async fn result_posts_become_one_recap_after_the_day_ends(pool: PgPool) {
+    let h = Harness::new(pool, &[(day(1), "cigar"), (day(2), "cigar")]);
+    let (alice, bob, cara) = (player(1, "Alice"), player(2, "Bob"), player(3, "Cara"));
+    h.svc.start_game_at(&alice, from_channel(GUILD_A, 9), Some(GameMode::Hard)).await.unwrap();
+    let (a, _) = accepted(h.guess(1, "cigar").await);
+    h.svc.start_game_at(&bob, from_channel(GUILD_A, 9), None).await.unwrap();
+    for w in LOSING {
+        accepted(h.guess(2, w).await);
+    }
+    let b = h.svc.board(2).await.unwrap().unwrap();
+    h.svc.start_game_at(&cara, from_channel(GUILD_A, 9), None).await.unwrap();
+    accepted(h.guess(3, "crane").await);
+    let (c, _) = accepted(h.guess(3, "cigar").await);
+
+    for (msg, v) in [(101, &a), (102, &b), (103, &c)] {
+        assert!(!h.svc.result_posted(v.game_id).await.unwrap());
+        h.svc.record_result_post(GUILD_A, day(1), 9, msg, v.game_id).await.unwrap();
+        assert!(h.svc.result_posted(v.game_id).await.unwrap());
+    }
+    // Same game recorded twice is ignored.
+    h.svc.record_result_post(GUILD_A, day(1), 9, 999, a.game_id).await.unwrap();
+
+    // Nothing to recap while the day is still open.
+    assert!(h.svc.pending_recaps().await.unwrap().is_empty());
+
+    h.clock.set_day(day(2));
+    let pending = h.svc.pending_recaps().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let r = &pending[0];
+    assert_eq!((r.guild_id, r.puzzle_date, r.channel_id, r.puzzle_number), (GUILD_A, day(1), 9, 2001));
+    assert_eq!(r.post_message_ids, vec![101, 102, 103]);
+
+    let results = h.svc.day_results(GUILD_A, day(1)).await.unwrap();
+    let summary: Vec<_> = results.iter().map(|r| (r.display_name.as_str(), r.won, r.guesses, r.mode)).collect();
+    assert_eq!(
+        summary,
+        vec![("Alice", true, 1, GameMode::Hard), ("Cara", true, 2, GameMode::Normal), ("Bob", false, 6, GameMode::Normal)]
+    );
+    let streak = h.svc.community_streak_on(GUILD_A, day(1)).await.unwrap();
+    assert_eq!(streak.current, 1);
+
+    h.svc.complete_recap(r, Some(500)).await.unwrap();
+    assert!(h.svc.pending_recaps().await.unwrap().is_empty(), "recap is done exactly once");
+    let left: (i64,) = sqlx::query_as("SELECT count(*) FROM wordle_result_posts").fetch_one(&h.pool).await.unwrap();
+    assert_eq!(left.0, 0);
 }

@@ -52,6 +52,8 @@ pub struct GameView {
     pub status: GameStatus,
     /// Community the game was started from (its streak is credited on a win).
     pub guild_id: Option<i64>,
+    /// Server channel the result is posted to when no results channel is set.
+    pub channel_id: Option<i64>,
     pub guesses: Vec<Guess>,
     /// Only populated once the player has lost; never exposed earlier.
     pub solution: Option<String>,
@@ -135,6 +137,34 @@ pub enum ShareOutcome {
     NoGame,
     InProgress,
     Ready(ShareData),
+}
+
+/// Where a game is being started from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// `!wordle play` in a server channel.
+    Server { guild_id: i64, channel_id: Option<i64> },
+    /// A DM: use the community and channel the player last played from.
+    Dm,
+}
+
+/// One finished game in a daily recap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DayResult {
+    pub display_name: String,
+    pub won: bool,
+    pub guesses: i16,
+    pub mode: GameMode,
+}
+
+/// A day whose individual result posts should be replaced by a recap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRecap {
+    pub guild_id: i64,
+    pub puzzle_date: NaiveDate,
+    pub puzzle_number: i32,
+    pub channel_id: i64,
+    pub post_message_ids: Vec<i64>,
 }
 
 /// A community's shared streak: consecutive days on which at least one player
@@ -227,6 +257,7 @@ struct GameRow {
     guesses_used: i16,
     status: String,
     guild_id: Option<i64>,
+    channel_id: Option<i64>,
     solution: String,
 }
 
@@ -303,6 +334,7 @@ impl GameService {
             mode: GameMode::parse(&row.mode).unwrap_or_default(),
             status,
             guild_id: row.guild_id,
+            channel_id: row.channel_id,
             guesses,
             solution: (status == GameStatus::Lost).then(|| row.solution.clone()),
         }
@@ -310,7 +342,7 @@ impl GameService {
 
     async fn lock_todays_game(tx: &mut Tx<'_>, user_id: i64, today: NaiveDate) -> Result<Option<GameRow>> {
         Ok(sqlx::query_as::<_, GameRow>(
-            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, g.guild_id, p.solution
+            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, g.guild_id, g.channel_id, p.solution
              FROM wordle_games g JOIN wordle_daily_puzzles p USING (puzzle_date)
              WHERE g.user_id = $1 AND g.puzzle_date = $2
              FOR UPDATE OF g",
@@ -321,36 +353,88 @@ impl GameService {
         .await?)
     }
 
-    /// Start or resume today's game. `requested` overrides the player's
-    /// preferred mode for today's game while it has no accepted guesses.
+    /// Start or resume today's game from a server (or from the DM when `guild_id`
+    /// is `None`). See [`GameService::start_game_at`].
     pub async fn start_game(
         &self,
         player: &Player,
         guild_id: Option<i64>,
         requested: Option<GameMode>,
     ) -> Result<StartOutcome> {
+        let origin = match guild_id {
+            Some(guild_id) => Origin::Server { guild_id, channel_id: None },
+            None => Origin::Dm,
+        };
+        self.start_game_at(player, origin, requested).await
+    }
+
+    /// Start or resume today's game. `requested` overrides the player's
+    /// preferred mode for today's game while it has no accepted guesses.
+    /// From a DM, the game belongs to the community the player last played
+    /// from; [`Error::NoHomeCommunity`] if they never started one from a server.
+    pub async fn start_game_at(&self, player: &Player, origin: Origin, requested: Option<GameMode>) -> Result<StartOutcome> {
         let today = self.today();
+        // Fetch (or read the cached) puzzle before opening the transaction, so a slow
+        // upstream call never holds a connection or row locks.
         let puzzle = self.puzzles.get_or_fetch(today, today).await?;
 
         let mut tx = self.pool.begin().await?;
         let preferred = Self::upsert_player(&mut tx, player, None).await?;
-        if let Some(guild) = guild_id {
-            sqlx::query(
-                "INSERT INTO wordle_guild_players (guild_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            )
-            .bind(guild)
-            .bind(player.user_id)
-            .execute(&mut *tx)
-            .await?;
-        }
+        let (guild_id, channel_id) = match origin {
+            Origin::Server { guild_id, channel_id } => {
+                sqlx::query(
+                    "INSERT INTO wordle_guild_players (guild_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                )
+                .bind(guild_id)
+                .bind(player.user_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE wordle_players SET home_guild_id = $2,
+                         home_channel_id = COALESCE($3, CASE WHEN home_guild_id = $2 THEN home_channel_id END)
+                     WHERE user_id = $1",
+                )
+                .bind(player.user_id)
+                .bind(guild_id)
+                .bind(channel_id)
+                .execute(&mut *tx)
+                .await?;
+                (guild_id, channel_id)
+            }
+            Origin::Dm => {
+                let home: (Option<i64>, Option<i64>) =
+                    sqlx::query_as("SELECT home_guild_id, home_channel_id FROM wordle_players WHERE user_id = $1")
+                        .bind(player.user_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                match home {
+                    (Some(g), c) => (g, c),
+                    (None, _) => {
+                        // A game already started today (e.g. before this column existed) still resumes.
+                        let existing: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+                            "SELECT guild_id, channel_id FROM wordle_games WHERE user_id = $1 AND puzzle_date = $2",
+                        )
+                        .bind(player.user_id)
+                        .bind(today)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        match existing {
+                            Some((Some(g), c)) => (g, c),
+                            _ => return Err(Error::NoHomeCommunity),
+                        }
+                    }
+                }
+            }
+        };
 
         let mode = requested.unwrap_or(preferred);
         let inserted = sqlx::query(
-            "INSERT INTO wordle_games (user_id, guild_id, puzzle_date, puzzle_number, mode)
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id, puzzle_date) DO NOTHING",
+            "INSERT INTO wordle_games (user_id, guild_id, channel_id, puzzle_date, puzzle_number, mode)
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (user_id, puzzle_date) DO NOTHING",
         )
         .bind(player.user_id)
         .bind(guild_id)
+        .bind(channel_id)
         .bind(today)
         .bind(puzzle.puzzle_number)
         .bind(mode.as_str())
@@ -583,7 +667,7 @@ impl GameService {
         let today = self.today();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query_as::<_, GameRow>(
-            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, g.guild_id, p.solution
+            "SELECT g.id, g.puzzle_date, g.puzzle_number, g.mode, g.guesses_used, g.status, g.guild_id, g.channel_id, p.solution
              FROM wordle_games g JOIN wordle_daily_puzzles p USING (puzzle_date)
              WHERE g.user_id = $1 AND g.puzzle_date = $2",
         )
@@ -652,7 +736,11 @@ impl GameService {
     /// when any game started from this community that day was won. Losses do not
     /// break it; only a day with no solves does.
     pub async fn community_streak(&self, guild_id: i64) -> Result<CommunityStreak> {
-        let today = self.today();
+        self.community_streak_on(guild_id, self.today()).await
+    }
+
+    /// Community streak as it stood on `today` (used for recaps of past days).
+    pub async fn community_streak_on(&self, guild_id: i64, today: NaiveDate) -> Result<CommunityStreak> {
         let days: Vec<(NaiveDate,)> = sqlx::query_as(
             "SELECT DISTINCT puzzle_date FROM wordle_games
              WHERE guild_id = $1 AND status = 'won' AND puzzle_date <= $2
@@ -682,6 +770,133 @@ impl GameService {
             puzzle_number,
             solved_today: solvers.into_iter().map(|(n,)| n).collect(),
         })
+    }
+
+    /// The channel a community wants results posted in, if one is set.
+    pub async fn results_channel(&self, guild_id: i64) -> Result<Option<i64>> {
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT results_channel_id FROM wordle_guild_settings WHERE guild_id = $1")
+                .bind(guild_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    /// Set (or clear with `None`) the community's results channel.
+    pub async fn set_results_channel(&self, guild_id: i64, channel_id: Option<i64>, updated_by: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO wordle_guild_settings (guild_id, results_channel_id, updated_by) VALUES ($1, $2, $3)
+             ON CONFLICT (guild_id) DO UPDATE SET results_channel_id = EXCLUDED.results_channel_id,
+                 updated_by = EXCLUDED.updated_by, updated_at = now()",
+        )
+        .bind(guild_id)
+        .bind(channel_id)
+        .bind(updated_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remember an automatic result post so it can be compacted later.
+    pub async fn record_result_post(
+        &self,
+        guild_id: i64,
+        puzzle_date: NaiveDate,
+        channel_id: i64,
+        message_id: i64,
+        game_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO wordle_result_posts (guild_id, puzzle_date, channel_id, message_id, game_id)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(guild_id)
+        .bind(puzzle_date)
+        .bind(channel_id)
+        .bind(message_id)
+        .bind(game_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether a game's result was already posted (avoids double posts on retries).
+    pub async fn result_posted(&self, game_id: i64) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM wordle_result_posts WHERE game_id = $1")
+            .bind(game_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// Past days (before today) that have result posts and no recap yet.
+    pub async fn pending_recaps(&self) -> Result<Vec<PendingRecap>> {
+        let rows: Vec<(i64, NaiveDate, i64, Vec<i64>, i32)> = sqlx::query_as(
+            "SELECT r.guild_id, r.puzzle_date, r.channel_id, array_agg(r.message_id ORDER BY r.id), d.puzzle_number
+             FROM wordle_result_posts r JOIN wordle_daily_puzzles d USING (puzzle_date)
+             WHERE r.puzzle_date < $1
+               AND NOT EXISTS (SELECT 1 FROM wordle_recaps c
+                               WHERE c.guild_id = r.guild_id AND c.puzzle_date = r.puzzle_date AND c.channel_id = r.channel_id)
+             GROUP BY r.guild_id, r.puzzle_date, r.channel_id, d.puzzle_number
+             ORDER BY r.puzzle_date, r.guild_id, r.channel_id",
+        )
+        .bind(self.today())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(guild_id, puzzle_date, channel_id, post_message_ids, puzzle_number)| PendingRecap {
+                guild_id,
+                puzzle_date,
+                puzzle_number,
+                channel_id,
+                post_message_ids,
+            })
+            .collect())
+    }
+
+    /// Everyone who finished `date`'s puzzle from this community, best first.
+    pub async fn day_results(&self, guild_id: i64, date: NaiveDate) -> Result<Vec<DayResult>> {
+        let rows: Vec<(String, bool, i16, String)> = sqlx::query_as(
+            "SELECT p.display_name, g.status = 'won', g.guesses_used, g.mode
+             FROM wordle_games g JOIN wordle_players p USING (user_id)
+             WHERE g.guild_id = $1 AND g.puzzle_date = $2 AND g.status <> 'in_progress'
+             ORDER BY (g.status = 'won') DESC, g.guesses_used, g.completed_at, g.id",
+        )
+        .bind(guild_id)
+        .bind(date)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(display_name, won, guesses, mode)| DayResult {
+                display_name,
+                won,
+                guesses,
+                mode: GameMode::parse(&mode).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Mark a recap as done and forget the individual posts it replaced.
+    pub async fn complete_recap(&self, recap: &PendingRecap, recap_message_id: Option<i64>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO wordle_recaps (guild_id, puzzle_date, channel_id, message_id) VALUES ($1, $2, $3, $4)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(recap.guild_id)
+        .bind(recap.puzzle_date)
+        .bind(recap.channel_id)
+        .bind(recap_message_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM wordle_result_posts WHERE message_id = ANY($1)")
+            .bind(&recap.post_message_ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn leaderboard(&self, guild_id: i64, sort: LeaderboardSort) -> Result<Vec<LeaderboardEntry>> {
