@@ -12,9 +12,13 @@ use wordle_bot::fluxer::gateway::{self, GatewayConfig};
 use wordle_bot::fluxer::preflight::{self, PreflightReport};
 use wordle_bot::fluxer::rest::RestClient;
 use wordle_bot::game::Dictionary;
-use wordle_bot::puzzle::{prefetch_loop, Clock, NytProvider, PuzzleService, SystemClock};
+use wordle_bot::config::PuzzleSource;
+use wordle_bot::puzzle::{
+    load_or_create_secret, parse_answers, prefetch_loop, Clock, LocalProvider, NytProvider, PuzzleService, SystemClock,
+    WordProvider,
+};
 use wordle_bot::service::GameService;
-use wordle_bot::{DEFAULT_WORDS, MIGRATOR};
+use wordle_bot::{DEFAULT_ANSWERS, DEFAULT_WORDS, MIGRATOR};
 
 const STARTUP_ATTEMPTS: u32 = 6;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -99,7 +103,24 @@ async fn run(check_only: bool) -> anyhow::Result<()> {
     anyhow::ensure!(!dictionary.is_empty(), "the word dictionary is empty");
     tracing::info!(words = dictionary.len(), "dictionary loaded");
 
-    let provider = Arc::new(NytProvider::new(config.nyt_base_url.clone())?);
+    let provider: Arc<dyn WordProvider> = match config.puzzle_source {
+        PuzzleSource::Nyt => {
+            tracing::info!("daily word: official NYT Wordle");
+            Arc::new(NytProvider::new(config.nyt_base_url.clone())?)
+        }
+        PuzzleSource::Local => {
+            let text = match &config.answers_file {
+                Some(path) => std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("cannot read ANSWERS_FILE {}: {e}", path.display()))?,
+                None => DEFAULT_ANSWERS.to_string(),
+            };
+            let answers = parse_answers(&text, &dictionary);
+            let secret = load_or_create_secret(&pool, config.word_secret.as_deref()).await?;
+            let local = LocalProvider::new(answers, &secret)?;
+            tracing::info!(answers = local.len(), "daily word: the bot's own word list (not the NYT puzzle)");
+            Arc::new(local)
+        }
+    };
     let puzzles = Arc::new(PuzzleService::new(pool.clone(), provider));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let prefetch_task = tokio::spawn(prefetch_loop(puzzles.clone(), clock.clone(), config.timezone));

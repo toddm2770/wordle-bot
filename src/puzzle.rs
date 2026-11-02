@@ -181,6 +181,93 @@ impl WordProvider for NytProvider {
     }
 }
 
+/// The bot's own daily word, independent of the NYT, so it can't be looked up.
+///
+/// The answer list is put in a fixed secret order (sorted by SHA-256 of
+/// `secret:word`) and day N of the Wordle calendar uses entry N (wrapping
+/// around). Without the secret the order can't be predicted, every word is used
+/// once before any repeats, and the same date always gives the same word.
+pub struct LocalProvider {
+    order: Vec<String>,
+}
+
+impl LocalProvider {
+    pub fn new(answers: Vec<String>, secret: &str) -> Result<LocalProvider> {
+        use sha2::{Digest, Sha256};
+        if answers.is_empty() {
+            return Err(Error::Config("the answer list is empty".into()));
+        }
+        let mut keyed: Vec<([u8; 32], String)> = answers
+            .into_iter()
+            .map(|w| {
+                let mut h = Sha256::new();
+                h.update(secret.as_bytes());
+                h.update(b":");
+                h.update(w.as_bytes());
+                (h.finalize().into(), w)
+            })
+            .collect();
+        keyed.sort();
+        keyed.dedup_by(|a, b| a.1 == b.1);
+        Ok(LocalProvider { order: keyed.into_iter().map(|(_, w)| w).collect() })
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    pub fn word_for(&self, date: NaiveDate) -> &str {
+        let day = puzzle_number_for(date) as i64;
+        &self.order[day.rem_euclid(self.order.len() as i64) as usize]
+    }
+}
+
+/// Parse an answer list: one word per line, `#` comments ignored. Only words the
+/// guess dictionary accepts are kept, so every answer can actually be typed.
+pub fn parse_answers(text: &str, dictionary: &crate::game::Dictionary) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|w| w.len() == WORD_LEN && w.bytes().all(|b| b.is_ascii_lowercase()) && dictionary.contains(w))
+        .collect()
+}
+
+#[async_trait]
+impl WordProvider for LocalProvider {
+    fn name(&self) -> &'static str {
+        "local"
+    }
+
+    async fn fetch(&self, date: NaiveDate) -> std::result::Result<ProviderPuzzle, ProviderError> {
+        Ok(ProviderPuzzle { number: None, solution: self.word_for(date).to_string() })
+    }
+}
+
+/// The secret that orders the local answer list: `WORDLE_SECRET` if set,
+/// otherwise generated once and kept in the database so it survives restarts.
+pub async fn load_or_create_secret(pool: &PgPool, configured: Option<&str>) -> Result<String> {
+    if let Some(s) = configured {
+        return Ok(s.to_string());
+    }
+    let generated: String = {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        (0..32).map(|_| format!("{:02x}", rng.gen::<u8>())).collect()
+    };
+    sqlx::query("INSERT INTO wordle_bot_settings (key, value) VALUES ('word_secret', $1) ON CONFLICT (key) DO NOTHING")
+        .bind(&generated)
+        .execute(pool)
+        .await?;
+    let (secret,): (String,) = sqlx::query_as("SELECT value FROM wordle_bot_settings WHERE key = 'word_secret'")
+        .fetch_one(pool)
+        .await?;
+    Ok(secret)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct Puzzle {
     pub puzzle_date: NaiveDate,
@@ -326,6 +413,59 @@ mod tests {
         let after = Utc.with_ymd_and_hms(2024, 3, 16, 4, 0, 0).unwrap();
         assert_eq!(puzzle_date(before, tz), date(2024, 3, 15));
         assert_eq!(puzzle_date(after, tz), date(2024, 3, 16));
+    }
+
+    fn local(words: &[&str], secret: &str) -> LocalProvider {
+        LocalProvider::new(words.iter().map(|w| w.to_string()).collect(), secret).unwrap()
+    }
+
+    #[test]
+    fn local_provider_is_deterministic_and_uses_every_word_once_per_cycle() {
+        let words = ["crane", "slate", "cigar", "rebut", "sissy", "humph", "awake"];
+        let p = local(&words, "s3cret");
+        let start = date(2026, 11, 3);
+        let cycle: Vec<String> =
+            (0..7).map(|i| p.word_for(start + chrono::Days::new(i)).to_string()).collect();
+        let mut sorted = cycle.clone();
+        sorted.sort();
+        let mut expected: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        expected.sort();
+        assert_eq!(sorted, expected, "each word exactly once per cycle");
+        // Same date, same word, even from a fresh provider; the cycle then repeats.
+        assert_eq!(local(&words, "s3cret").word_for(start), p.word_for(start));
+        assert_eq!(p.word_for(start + chrono::Days::new(7)), p.word_for(start));
+    }
+
+    #[test]
+    fn local_provider_order_depends_on_the_secret() {
+        let words: Vec<String> = (0..200).map(|i| format!("w{i:04}")).collect();
+        let a = LocalProvider::new(words.clone(), "one").unwrap();
+        let b = LocalProvider::new(words, "two").unwrap();
+        let d = date(2026, 11, 3);
+        let same = (0..50).filter(|i| a.word_for(d + chrono::Days::new(*i)) == b.word_for(d + chrono::Days::new(*i))).count();
+        assert!(same < 5, "different secrets must give different orders ({same} matches)");
+    }
+
+    #[test]
+    fn local_provider_rejects_empty_list_and_dedupes() {
+        assert!(LocalProvider::new(vec![], "s").is_err());
+        assert_eq!(local(&["crane", "crane", "slate"], "s").len(), 2);
+    }
+
+    #[test]
+    fn parse_answers_skips_comments_and_unknown_words() {
+        let dict = crate::game::Dictionary::from_text("crane\nslate\ncigar\n");
+        let parsed = parse_answers("# header\nCrane\n\nzzzzz\nslate\ntoolong\n", &dict);
+        assert_eq!(parsed, vec!["crane".to_string(), "slate".to_string()]);
+    }
+
+    #[test]
+    fn bundled_answers_are_all_valid_guesses() {
+        let dict = crate::game::Dictionary::from_text(crate::DEFAULT_WORDS);
+        let raw = crate::DEFAULT_ANSWERS.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).count();
+        let parsed = parse_answers(crate::DEFAULT_ANSWERS, &dict);
+        assert_eq!(parsed.len(), raw);
+        assert!(parsed.len() > 1500);
     }
 
     #[test]

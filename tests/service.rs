@@ -793,3 +793,35 @@ async fn result_posts_become_one_recap_after_the_day_ends(pool: PgPool) {
     let left: (i64,) = sqlx::query_as("SELECT count(*) FROM wordle_result_posts").fetch_one(&h.pool).await.unwrap();
     assert_eq!(left.0, 0);
 }
+
+// ---------------------------------------------------------------- local word provider
+
+#[sqlx::test(migrator = "wordle_bot::MIGRATOR")]
+async fn local_word_secret_is_generated_once_and_kept(pool: PgPool) {
+    use wordle_bot::puzzle::{load_or_create_secret, parse_answers, LocalProvider};
+    let first = load_or_create_secret(&pool, None).await.unwrap();
+    assert_eq!(first.len(), 64);
+    // A restart reads the same secret back, so the word order never changes.
+    assert_eq!(load_or_create_secret(&pool, None).await.unwrap(), first);
+    // An explicit secret wins.
+    assert_eq!(load_or_create_secret(&pool, Some("mine")).await.unwrap(), "mine");
+
+    // The local word is what players get, and it is cached like any other puzzle.
+    let dict = Dictionary::from_text(WORDS);
+    let answers = parse_answers(WORDS, &dict);
+    let local = Arc::new(LocalProvider::new(answers, &first).unwrap());
+    let expected = local.word_for(day(1)).to_string();
+    let clock = Arc::new(TestClock(Mutex::new(noon(day(1)))));
+    let svc = GameService::new(
+        pool.clone(),
+        Arc::new(PuzzleService::new(pool.clone(), local)),
+        Arc::new(dict),
+        clock,
+        "America/New_York".parse().unwrap(),
+    );
+    svc.start_game(&player(1, "A"), Some(GUILD_A), None).await.unwrap();
+    let (view, _) = accepted(svc.submit_guess(1, &expected, None).await.unwrap());
+    assert_eq!(view.status, GameStatus::Won);
+    let source: (String,) = sqlx::query_as("SELECT source FROM wordle_daily_puzzles").fetch_one(&pool).await.unwrap();
+    assert_eq!(source.0, "local");
+}

@@ -2,7 +2,7 @@
 
 A NYT-style daily Wordle bot for a self-hosted [Fluxer](https://fluxer.app) instance, written in Rust (Tokio, Reqwest, Serde, SQLx).
 
-- Everyone gets the official NYT daily word, which rolls over at midnight `America/New_York`.
+- Everyone gets the same daily word (the bot's own by default, or the official NYT one), rolling over at midnight `America/New_York`.
 - Normal and hard mode (NYT hard-mode rules, including repeated letters), six guesses, 🟩🟨⬛ feedback.
 - Games start from a server channel and are played privately in DMs, so nobody sees anyone else's guesses.
 - Personal stats, spoiler-free sharing, and a per-community leaderboard with **Words Solved**, **Current Streak** and **Longest Streak**.
@@ -10,6 +10,15 @@ A NYT-style daily Wordle bot for a self-hosted [Fluxer](https://fluxer.app) inst
 - Outbound connections only: no published port and no Nginx Proxy Manager entry.
 
 ---
+
+## Where the daily word comes from
+
+By default (`PUZZLE_PROVIDER=local`) the bot uses **its own daily word**, not the NYT's, so nobody can look the answer up online and paste it in. Everyone in your server still gets the same word each day.
+
+- **The word list:** `data/answers.txt` holds 1,688 common English five-letter words. They were picked from the guess dictionary by word frequency, with no names, plurals or past tenses, and screened by hand for crude or offensive words.
+- **The order:** the list is shuffled with a secret key. If `WORDLE_SECRET` isn't set, the key is generated once and stored in the database. Each day takes the next word, so no word repeats until the whole list has been used (about 4½ years), and the order can't be predicted without the key.
+- **Official NYT word instead:** set `PUZZLE_PROVIDER=nyt` to go back to the NYT Wordle of the day.
+- **Switching takes effect the next day:** a day's word is fixed once its puzzle has been cached, so switching mid-day never changes a game in progress.
 
 ## Commands
 

@@ -7,6 +7,15 @@ use crate::fluxer::endpoints::EndpointConfig;
 
 pub const DEFAULT_INSTANCE_URL: &str = "https://fluxer.squeekienuts.net";
 
+/// Where the daily word comes from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PuzzleSource {
+    /// The bot's own word from its answer list (can't be looked up elsewhere).
+    Local,
+    /// The official NYT Wordle of the day.
+    Nyt,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub bot_token: String,
@@ -16,6 +25,9 @@ pub struct Config {
     pub command_prefix: String,
     pub nyt_base_url: String,
     pub words_file: Option<PathBuf>,
+    pub puzzle_source: PuzzleSource,
+    pub answers_file: Option<PathBuf>,
+    pub word_secret: Option<String>,
     pub leaderboard_size: usize,
     /// Replace each day's individual result posts with one recap after midnight.
     pub compact_results: bool,
@@ -30,6 +42,7 @@ impl std::fmt::Debug for Config {
             .field("database_url", &"<redacted>")
             .field("timezone", &self.timezone)
             .field("command_prefix", &self.command_prefix)
+            .field("puzzle_source", &self.puzzle_source)
             .finish_non_exhaustive()
     }
 }
@@ -76,6 +89,12 @@ impl Config {
             Some(_) => return Err(Error::Config("COMPACT_RESULTS must be true or false".into())),
         };
 
+        let puzzle_source = match val("PUZZLE_PROVIDER").map(|v| v.to_ascii_lowercase()).as_deref() {
+            None | Some("local") => PuzzleSource::Local,
+            Some("nyt") => PuzzleSource::Nyt,
+            Some(_) => return Err(Error::Config("PUZZLE_PROVIDER must be `local` or `nyt`".into())),
+        };
+
         Ok(Config {
             bot_token,
             endpoints: EndpointConfig {
@@ -88,6 +107,9 @@ impl Config {
             command_prefix: val("COMMAND_PREFIX").unwrap_or_else(|| "!wordle".into()),
             nyt_base_url: val("NYT_WORDLE_URL").unwrap_or_else(|| "https://www.nytimes.com/svc/wordle/v2".into()),
             words_file: val("WORDS_FILE").map(PathBuf::from),
+            puzzle_source,
+            answers_file: val("ANSWERS_FILE").map(PathBuf::from),
+            word_secret: val("WORDLE_SECRET"),
             leaderboard_size,
             compact_results,
         })
@@ -113,6 +135,10 @@ mod tests {
         assert_eq!(c.command_prefix, "!wordle");
         assert_eq!(c.leaderboard_size, 15);
         assert!(c.compact_results);
+        assert_eq!(c.puzzle_source, PuzzleSource::Local);
+        assert!(cfg(&[("FLUXER_BOT_TOKEN", "1.a"), ("DATABASE_URL", "x"), ("PUZZLE_PROVIDER", "bogus")]).is_err());
+        let nyt = cfg(&[("FLUXER_BOT_TOKEN", "1.a"), ("DATABASE_URL", "x"), ("PUZZLE_PROVIDER", "NYT")]).unwrap();
+        assert_eq!(nyt.puzzle_source, PuzzleSource::Nyt);
     }
 
     #[test]
